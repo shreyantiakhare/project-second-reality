@@ -1,0 +1,130 @@
+import cv2
+import numpy as np
+from collections import deque
+
+cap = cv2.VideoCapture(0)
+
+# Red color ranges (HSV)
+lower_red1 = np.array([0, 150, 80])
+upper_red1 = np.array([10, 255, 255])
+lower_red2 = np.array([170, 150, 80])
+upper_red2 = np.array([179, 255, 255])
+
+# Last 64 positions of the ball (newest first)
+trail = deque(maxlen=64)
+
+# Physics settings
+GRAVITY = 1.0    # pixels per frame^2 (we will tune this later)
+PREDICT_FRAMES = 20     # how many frames into the future to draw
+VELOCITY_WINDOW = 5     # use the last 5 positions to estimate speed
+
+# Error measurement settings
+ERROR_HORIZON = 5       # compare prediction vs reality after 5 frames
+pending = deque()       # stores (target_frame, predicted_x, predicted_y)
+frame_no = 0
+errors = []             # all measured errors (pixels)
+last_error = None
+
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        print("Error: Could not read frame")
+        break
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    mask = cv2.bitwise_or(mask1, mask2)
+    mask = cv2.erode(mask, None, iterations=2)
+    mask = cv2.dilate(mask, None, iterations=2)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    center = None
+    if contours:
+        c = max(contours, key=cv2.contourArea)
+        (x, y), radius = cv2.minEnclosingCircle(c)
+        if radius > 10:
+            center = (int(x), int(y))
+            cv2.circle(frame, center, int(radius), (0, 255, 0), 2)
+            cv2.circle(frame, center, 4, (0, 255, 255), -1)
+
+    trail.appendleft(center)
+    frame_no += 1
+
+    # Check if any old prediction is now due; compare with the real position
+    while pending and pending[0][0] <= frame_no:
+        target_frame, pred_x, pred_y = pending.popleft()
+        if target_frame == frame_no and center is not None:
+            last_error = float(np.hypot(center[0] - pred_x, center[1] - pred_y))
+            if last_error < 150:
+                errors.append(last_error)
+    # Draw the actual trail (red)
+    for i in range(1, len(trail)):
+        if trail[i - 1] is None or trail[i] is None:
+            continue
+        cv2.line(frame, trail[i - 1], trail[i], (0, 0, 255), 2)
+
+    # ---- PREDICTION ----
+    recent = [p for p in list(trail)[:VELOCITY_WINDOW] if p is not None]
+
+    if len(recent) >= 3:
+        steps = len(recent) - 1
+        vx = (recent[0][0] - recent[-1][0]) / steps
+        vy = (recent[0][1] - recent[-1][1]) / steps
+        vy_start = vy
+
+        # Draw predicted path (yellow dots)
+        px, py = float(recent[0][0]), float(recent[0][1])
+        h, w = frame.shape[:2]
+        for t in range(PREDICT_FRAMES):
+            vy += GRAVITY
+            px += vx
+            py += vy
+            if px < 0 or px >= w or py < 0 or py >= h:
+                break
+            if t % 2 == 0:
+                cv2.circle(frame, (int(px), int(py)), 3, (0, 255, 255), -1)
+
+        # Save the predicted position ERROR_HORIZON frames ahead
+        ex, ey, evy = float(recent[0][0]), float(recent[0][1]), vy_start
+        for _ in range(ERROR_HORIZON):
+            evy += GRAVITY
+            ex += vx
+            ey += evy
+        pending.append((frame_no + ERROR_HORIZON, ex, ey))
+
+        cv2.putText(frame, "Prediction: Available", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    else:
+        cv2.putText(frame, "Prediction: Waiting for data", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+
+    status = "Ball: Tracked" if center else "Ball: Not found"
+    cv2.putText(frame, status, (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+    # Show measured error
+    if last_error is not None and errors:
+        avg = sum(errors) / len(errors)
+        cv2.putText(frame, f"Prediction error: {last_error:.1f} px", (10, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame, f"Average error: {avg:.1f} px", (10, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+    cv2.imshow("Webcam", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+if errors:
+    print(f"GRAVITY = {GRAVITY}")
+    print(f"Measurements: {len(errors)}")
+    print(f"Average error: {sum(errors) / len(errors):.1f} px")
+    print(f"Median error: {float(np.median(errors)):.1f} px")
+
+cap.release()
+cv2.destroyAllWindows()
+
